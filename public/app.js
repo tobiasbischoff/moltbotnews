@@ -4,8 +4,6 @@ const state = {
   initializing: false,
 };
 
-let pendingSyncTimer = null;
-
 const elements = {
   timeline: document.getElementById("timeline"),
   loadingCard: document.getElementById("loadingCard"),
@@ -196,7 +194,7 @@ function buildDayCard(day, index) {
               ? buildSummaryHtml(day.summary)
               : `<p>${
                   aiEnabled
-                    ? "🦞 Generate the lobster log for this day’s changes."
+                    ? "🦞 Lobster log is cooking in the background."
                     : "AI summaries are disabled until the API key is configured."
                 }</p>`
           }
@@ -333,38 +331,15 @@ async function loadCommits(force = false) {
     state.data = mergeSummaries(state.data, data);
     state.initializing = Boolean(data.cache?.initializing);
     if (data.cache?.initializing && data.days.length === 0) {
-      const synced = data.cache?.commitCount ?? 0;
-      const issuesCount = data.cache?.issues?.count ?? 0;
-      setLoadingMessage(
-        "Syncing from GitHub…",
-        `🦞 Synced ${synced} commits${issuesCount ? ` and ${issuesCount} issues/PRs` : ""} so far…`
+      renderEmpty(
+        "Syncing in the background. Refresh when you want the latest.",
+        "No commits stored yet"
       );
-      if (data.cache?.pending) {
-        if (pendingSyncTimer) clearTimeout(pendingSyncTimer);
-        pendingSyncTimer = setTimeout(() => {
-          loadCommits(false);
-        }, 6000);
-      }
+      updateMeta(state.data);
       return;
     }
     renderTimeline(state.data);
     updateMeta(state.data);
-    if (state.data.cache?.pending) {
-      if (pendingSyncTimer) clearTimeout(pendingSyncTimer);
-      pendingSyncTimer = setTimeout(() => {
-        loadCommits(false);
-      }, 6000);
-    } else if (pendingSyncTimer) {
-      clearTimeout(pendingSyncTimer);
-      pendingSyncTimer = null;
-    }
-    if (state.data.aiAvailable) {
-      const todayKey = new Date().toISOString().split("T")[0];
-      const today = state.data.days.find((day) => day.date === todayKey);
-      if (today) {
-        summarizeDay(today.date);
-      }
-    }
   } catch (error) {
     renderEmpty(error.message || "Unable to load commits.");
   }

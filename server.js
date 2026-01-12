@@ -659,6 +659,308 @@ function buildThemeHighlights(commits, maxItems = 6) {
     });
 }
 
+function getCachedSummaryRow(date) {
+  return dbGet(
+    `
+    SELECT fingerprint, summary_json, raw_text, prompt_text, response_text, response_json, updated_at
+    FROM daily_summaries
+    WHERE repo = ? AND date = ?
+  `,
+    [REPO, date]
+  );
+}
+
+function buildCachedSummaryPayload(cached, debug) {
+  const payload = {
+    summary: cached.summary_json ? JSON.parse(cached.summary_json) : null,
+    raw: cached.raw_text || "",
+    cache: { source: "sqlite" },
+  };
+  if (debug) {
+    payload.debug = {
+      prompt: cached.prompt_text || "",
+      responseText: cached.response_text || "",
+      responseJson: cached.response_json
+        ? JSON.parse(cached.response_json)
+        : null,
+      updatedAt: cached.updated_at,
+    };
+  }
+  return payload;
+}
+
+async function createSummaryPayload({ date, commits, force = false, debug = false }) {
+  if (!Array.isArray(commits) || commits.length === 0) {
+    const error = new Error("No commits provided");
+    error.status = 400;
+    throw error;
+  }
+
+  const fingerprint = commits.map((commit) => commit.sha).join("|");
+  if (!force) {
+    const cached = getCachedSummaryRow(date);
+    if (cached && cached.fingerprint === fingerprint) {
+      return buildCachedSummaryPayload(cached, debug);
+    }
+  }
+
+  if (!summarizer) {
+    const error = new Error("AI summary not configured");
+    error.status = 503;
+    throw error;
+  }
+
+  const systemPrompt =
+    "You are a lobster keeping a clear, friendly daily change log. " +
+    "Summarize changes in plain language without corporate tone. " +
+    "Name concrete areas (folders, commands, features) instead of generic phrases. " +
+    "Avoid using the word 'update' or 'updates' unless referring to a version. " +
+    "Classify work as feature, fix, refactor, docs, test, or chore. " +
+    "Be concise, factual, and avoid speculation.";
+
+  const summaryShape = `{\n  \"summary\": \"1-2 sentence summary\",\n  \"highlights\": [\"bullet\", \"bullet\"],\n  \"type_breakdown\": { \"feature\": 0, \"fix\": 0, \"refactor\": 0, \"docs\": 0, \"test\": 0, \"chore\": 0, \"other\": 0 },\n  \"risks\": [\"short risk if any\", \"or empty array if none\"]\n}`;
+
+  const attempts = [];
+  const callModel = async ({ overrideSystem, prompt, maxTokens }) => {
+    const response = await summarizer.messages.create({
+      model: AI_MODEL,
+      max_tokens: maxTokens ?? SUMMARY_MAX_TOKENS,
+      temperature: 0.1,
+      thinking: { type: "disabled" },
+      system: overrideSystem || systemPrompt,
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: prompt }],
+        },
+      ],
+    });
+    attempts.push({
+      id: response.id,
+      model: response.model,
+      content: response.content,
+      stop_reason: response.stop_reason,
+      usage: response.usage,
+      system: overrideSystem || systemPrompt,
+    });
+    return response;
+  };
+
+  const makePrompt = (commitLines, extraContext = "") => `
+Date: ${date}
+Repository: ${REPO}
+${extraContext}
+Commits (newest first):
+${commitLines}
+
+Guidelines:
+- Provide 6-10 highlights describing distinct themes (not individual commits).
+- Avoid listing raw commit titles.
+- Use concrete terms like folder names, tools, features, or config areas.
+- Do not use the word "update" or "updates".
+
+Return JSON only with this shape:
+${summaryShape}
+Return a single valid JSON object only. Do not wrap it in markdown code fences.
+`;
+
+  await enrichCommitFiles(commits, SUMMARY_FILE_COMMITS);
+  const filesForShas = new Set(
+    selectTopCommits(commits, SUMMARY_FILE_COMMITS).map((commit) => commit.sha)
+  );
+  const chunks =
+    commits.length > MAX_COMMITS_PER_PROMPT
+      ? chunkArray(commits, CHUNK_SIZE)
+      : [commits];
+  const chunkSummaries = [];
+  const chunkResponses = [];
+  let finalPrompt = "";
+  let rawText = "";
+  let parsed = null;
+
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index];
+    const extraContext =
+      chunks.length > 1
+        ? `Chunk ${index + 1} of ${chunks.length}.`
+        : "";
+    const commitLines = formatCommitLines(chunk, {
+      includeFiles: true,
+      filesForShas,
+    });
+    const chunkPrompt = makePrompt(commitLines, extraContext);
+    let response = await callModel({
+      prompt: chunkPrompt,
+      maxTokens: Math.min(SUMMARY_MAX_TOKENS, 800),
+    });
+
+    let chunkText = response.content
+      ?.filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("\n")
+      .trim();
+
+    if (!chunkText) {
+      const retrySystem =
+        systemPrompt +
+        " Return ONLY a valid JSON object. Do not include analysis or reasoning.";
+      response = await callModel({
+        overrideSystem: retrySystem,
+        prompt: chunkPrompt,
+        maxTokens: Math.min(SUMMARY_MAX_TOKENS, 800),
+      });
+      chunkText = response.content
+        ?.filter((block) => block.type === "text")
+        .map((block) => block.text)
+        .join("\n")
+        .trim();
+    }
+
+    const parsedChunk = parseAiResponse(chunkText || "", chunk);
+    chunkSummaries.push(parsedChunk);
+    chunkResponses.push({ prompt: chunkPrompt, rawText: chunkText || "" });
+  }
+
+  if (chunkSummaries.length === 1) {
+    parsed = chunkSummaries[0];
+    rawText = chunkResponses[0]?.rawText || "";
+    finalPrompt = chunkResponses[0]?.prompt || "";
+  } else {
+    const combinedPrompt = `
+Date: ${date}
+Repository: ${REPO}
+Total commits: ${commits.length}
+Type breakdown (authoritative): ${JSON.stringify(buildTypeBreakdown(commits))}
+Chunk summaries (for context):
+${chunkSummaries
+  .map(
+    (summary, idx) =>
+      `${idx + 1}. Summary: ${summary.summary}\nHighlights: ${
+        summary.highlights?.join("; ") || "n/a"
+      }\nRisks: ${summary.risks?.join("; ") || "n/a"}`
+  )
+  .join("\n\n")}
+
+Guidelines:
+- Provide 6-10 highlights describing distinct themes (not individual commits).
+- Avoid listing raw commit titles.
+- Use concrete terms like folder names, tools, features, or config areas.
+- Do not use the word "update" or "updates".
+
+Return JSON only with this shape:
+${summaryShape}
+Return a single valid JSON object only. Do not wrap it in markdown code fences.
+`;
+
+    const response = await callModel({
+      prompt: combinedPrompt,
+      maxTokens: SUMMARY_MAX_TOKENS,
+      overrideSystem:
+        systemPrompt +
+        " Return ONLY a valid JSON object. Do not include analysis or reasoning.",
+    });
+
+    rawText = response.content
+      ?.filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("\n")
+      .trim();
+
+    parsed = parseAiResponse(rawText || "", commits);
+    if (parsed) {
+      parsed.type_breakdown = buildTypeBreakdown(commits);
+    }
+    finalPrompt = combinedPrompt.trim();
+  }
+
+  if (parsed) {
+    parsed.type_breakdown = buildTypeBreakdown(commits);
+    const minHighlights = 6;
+    const existingHighlights = Array.isArray(parsed.highlights)
+      ? parsed.highlights
+      : [];
+    let mergedHighlights = [...existingHighlights];
+
+    if (mergedHighlights.length < minHighlights && chunkSummaries.length > 1) {
+      const chunkHighlights = chunkSummaries
+        .map((summary) => summary.summary)
+        .filter(Boolean)
+        .filter((text) => text !== parsed.summary);
+      mergedHighlights = mergedHighlights.concat(chunkHighlights);
+    }
+
+    if (mergedHighlights.length < minHighlights) {
+      mergedHighlights = mergedHighlights.concat(
+        buildThemeHighlights(commits, minHighlights)
+      );
+    }
+
+    const deduped = [];
+    const seen = new Set();
+    for (const item of mergedHighlights) {
+      const normalized = String(item).trim();
+      if (!normalized) continue;
+      const key = normalized.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(normalized);
+    }
+    parsed.highlights = deduped.slice(0, Math.max(minHighlights, deduped.length));
+  }
+
+  const responseSnapshot = {
+    attempts,
+    chunks: chunkSummaries.length,
+    chunkResponses,
+  };
+
+  const payload = {
+    summary: parsed || null,
+    raw: rawText,
+    cache: { source: "minimax", chunks: chunkSummaries.length },
+  };
+
+  dbRun(
+    `
+    INSERT INTO daily_summaries (
+      repo, date, fingerprint, summary_json, raw_text,
+      prompt_text, response_text, response_json, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(repo, date) DO UPDATE SET
+      fingerprint = excluded.fingerprint,
+      summary_json = excluded.summary_json,
+      raw_text = excluded.raw_text,
+      prompt_text = excluded.prompt_text,
+      response_text = excluded.response_text,
+      response_json = excluded.response_json,
+      updated_at = excluded.updated_at
+  `,
+    [
+      REPO,
+      date,
+      fingerprint,
+      parsed ? JSON.stringify(parsed) : null,
+      rawText,
+      finalPrompt || "",
+      rawText,
+      JSON.stringify(responseSnapshot),
+      new Date().toISOString(),
+    ]
+  );
+  persistDb();
+
+  if (debug) {
+    payload.debug = {
+      prompt: finalPrompt || "",
+      responseText: rawText,
+      responseJson: responseSnapshot,
+    };
+  }
+
+  return payload;
+}
+
 function parseAiResponse(rawText, commits) {
   let parsed = extractJson(rawText);
   if (!parsed) {
@@ -719,6 +1021,21 @@ function loadCachedCommits({ sinceIso }) {
     ORDER BY date DESC
   `,
     [REPO, BRANCH, sinceIso]
+  );
+  return rows.map((row) => JSON.parse(row.data));
+}
+
+function loadCommitsForDate(dateKey) {
+  const start = new Date(`${dateKey}T00:00:00.000Z`);
+  const end = new Date(start);
+  end.setUTCDate(end.getUTCDate() + 1);
+  const rows = dbAll(
+    `
+    SELECT data FROM commits
+    WHERE repo = ? AND branch = ? AND date >= ? AND date < ?
+    ORDER BY date DESC
+  `,
+    [REPO, BRANCH, start.toISOString(), end.toISOString()]
   );
   return rows.map((row) => JSON.parse(row.data));
 }
@@ -994,12 +1311,41 @@ async function syncCommits({ sinceIso, force }) {
 
 let commitsSyncPromise = null;
 let issuesSyncPromise = null;
+const summaryJobs = new Map();
+
+function scheduleSummaryForDate(dateKey) {
+  if (!summarizer || !dateKey) return;
+  if (summaryJobs.has(dateKey)) return;
+  const commits = loadCommitsForDate(dateKey);
+  if (!commits.length) return;
+  const fingerprint = commits.map((commit) => commit.sha).join("|");
+  const cached = getCachedSummaryRow(dateKey);
+  if (cached && cached.fingerprint === fingerprint) return;
+
+  const job = (async () => {
+    try {
+      await createSummaryPayload({ date: dateKey, commits });
+    } catch (error) {
+      console.warn(`Summary job failed for ${dateKey}:`, error.message);
+    } finally {
+      summaryJobs.delete(dateKey);
+    }
+  })();
+
+  summaryJobs.set(dateKey, job);
+}
 
 async function runCommitsSync({ sinceIso, force }) {
   if (!commitsSyncPromise) {
-    commitsSyncPromise = syncCommits({ sinceIso, force }).finally(() => {
+    commitsSyncPromise = syncCommits({ sinceIso, force })
+      .then((result) => {
+        const todayKey = new Date().toISOString().split("T")[0];
+        scheduleSummaryForDate(todayKey);
+        return result;
+      })
+      .finally(() => {
       commitsSyncPromise = null;
-    });
+      });
   }
   return commitsSyncPromise;
 }
@@ -1103,8 +1449,6 @@ app.get("/api/commits", async (req, res) => {
     const sinceIso = since.toISOString();
     const cachedBefore = loadCachedCommits({ sinceIso });
     const forceSync = req.query.force === "1";
-    const hasAnyCommits = Boolean(getLatestCommitDate());
-    const shouldBlock = !hasAnyCommits || forceSync;
     const backfillPending =
       !getMeta("commits_backfill_since") ||
       new Date(getMeta("commits_backfill_since")).getTime() >
@@ -1125,7 +1469,7 @@ app.get("/api/commits", async (req, res) => {
       error: null,
     };
 
-    if (shouldBlock) {
+    if (forceSync) {
       try {
         const commitSync = await awaitWithTimeout(
           runCommitsSync({ sinceIso, force: true }),
@@ -1195,6 +1539,10 @@ app.get("/api/commits", async (req, res) => {
     }
 
     const responseCommits = loadCachedCommits({ sinceIso });
+    const todayKey = new Date().toISOString().split("T")[0];
+    if (responseCommits.length > 0) {
+      scheduleSummaryForDate(todayKey);
+    }
     const issues = loadIssues({ sinceIso, isPr: false });
     const pullRequests = loadIssues({ sinceIso, isPr: true });
     const summaries = loadSummaries({ sinceIso });
@@ -1256,298 +1604,18 @@ app.get("/api/commits", async (req, res) => {
 
 app.post("/api/summarize", async (req, res) => {
   const { date, commits, force, debug } = req.body || {};
-  if (!Array.isArray(commits) || commits.length === 0) {
-    return res.status(400).json({ error: "No commits provided" });
-  }
-  const fingerprint = commits.map((commit) => commit.sha).join("|");
-  if (!force) {
-    const cached = dbGet(
-      `
-      SELECT fingerprint, summary_json, raw_text, prompt_text, response_text, response_json, updated_at
-      FROM daily_summaries
-      WHERE repo = ? AND date = ?
-    `,
-      [REPO, date]
-    );
-    if (cached && cached.fingerprint === fingerprint) {
-      const payload = {
-        summary: cached.summary_json ? JSON.parse(cached.summary_json) : null,
-        raw: cached.raw_text || "",
-        cache: { source: "sqlite" },
-      };
-      if (debug) {
-        payload.debug = {
-          prompt: cached.prompt_text || "",
-          responseText: cached.response_text || "",
-          responseJson: cached.response_json
-            ? JSON.parse(cached.response_json)
-            : null,
-          updatedAt: cached.updated_at,
-        };
-      }
-      return res.json(payload);
-    }
-  }
-
-  if (!summarizer) {
-    return res.status(503).json({
-      error: "AI summary not configured",
-      details: "Set ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL",
-    });
-  }
-
-  const systemPrompt =
-    "You are a lobster keeping a clear, friendly daily change log. " +
-    "Summarize changes in plain language without corporate tone. " +
-    "Name concrete areas (folders, commands, features) instead of generic phrases. " +
-    "Avoid using the word 'update' or 'updates' unless referring to a version. " +
-    "Classify work as feature, fix, refactor, docs, test, or chore. " +
-    "Be concise, factual, and avoid speculation.";
-
-  const summaryShape = `{\n  \"summary\": \"1-2 sentence summary\",\n  \"highlights\": [\"bullet\", \"bullet\"],\n  \"type_breakdown\": { \"feature\": 0, \"fix\": 0, \"refactor\": 0, \"docs\": 0, \"test\": 0, \"chore\": 0, \"other\": 0 },\n  \"risks\": [\"short risk if any\", \"or empty array if none\"]\n}`;
-
   try {
-    const attempts = [];
-    const callModel = async ({ overrideSystem, prompt, maxTokens }) => {
-      const response = await summarizer.messages.create({
-        model: AI_MODEL,
-        max_tokens: maxTokens ?? SUMMARY_MAX_TOKENS,
-        temperature: 0.1,
-        thinking: { type: "disabled" },
-        system: overrideSystem || systemPrompt,
-        messages: [
-          {
-            role: "user",
-            content: [{ type: "text", text: prompt }],
-          },
-        ],
-      });
-      attempts.push({
-        id: response.id,
-        model: response.model,
-        content: response.content,
-        stop_reason: response.stop_reason,
-        usage: response.usage,
-        system: overrideSystem || systemPrompt,
-      });
-      return response;
-    };
-
-    const makePrompt = (commitLines, extraContext = "") => `
-Date: ${date}
-Repository: ${REPO}
-${extraContext}
-Commits (newest first):
-${commitLines}
-
-Guidelines:
-- Provide 6-10 highlights describing distinct themes (not individual commits).
-- Avoid listing raw commit titles.
-- Use concrete terms like folder names, tools, features, or config areas.
-- Do not use the word "update" or "updates".
-
-Return JSON only with this shape:
-${summaryShape}
-Return a single valid JSON object only. Do not wrap it in markdown code fences.
-`;
-
-    await enrichCommitFiles(commits, SUMMARY_FILE_COMMITS);
-    const filesForShas = new Set(
-      selectTopCommits(commits, SUMMARY_FILE_COMMITS).map((commit) => commit.sha)
-    );
-    const chunks =
-      commits.length > MAX_COMMITS_PER_PROMPT
-        ? chunkArray(commits, CHUNK_SIZE)
-        : [commits];
-    const chunkSummaries = [];
-    const chunkResponses = [];
-    let finalPrompt = "";
-    let rawText = "";
-    let parsed = null;
-
-    for (let index = 0; index < chunks.length; index += 1) {
-      const chunk = chunks[index];
-      const extraContext =
-        chunks.length > 1
-          ? `Chunk ${index + 1} of ${chunks.length}.`
-          : "";
-      const commitLines = formatCommitLines(chunk, {
-        includeFiles: true,
-        filesForShas,
-      });
-      const chunkPrompt = makePrompt(commitLines, extraContext);
-      let response = await callModel({
-        prompt: chunkPrompt,
-        maxTokens: Math.min(SUMMARY_MAX_TOKENS, 800),
-      });
-
-      let chunkText = response.content
-        ?.filter((block) => block.type === "text")
-        .map((block) => block.text)
-        .join("\n")
-        .trim();
-
-      if (!chunkText) {
-        const retrySystem =
-          systemPrompt +
-          " Return ONLY a valid JSON object. Do not include analysis or reasoning.";
-        response = await callModel({
-          overrideSystem: retrySystem,
-          prompt: chunkPrompt,
-          maxTokens: Math.min(SUMMARY_MAX_TOKENS, 800),
-        });
-        chunkText = response.content
-          ?.filter((block) => block.type === "text")
-          .map((block) => block.text)
-          .join("\n")
-          .trim();
-      }
-
-      const parsedChunk = parseAiResponse(chunkText || "", chunk);
-      chunkSummaries.push(parsedChunk);
-      chunkResponses.push({ prompt: chunkPrompt, rawText: chunkText || "" });
-    }
-
-    if (chunkSummaries.length === 1) {
-      parsed = chunkSummaries[0];
-      rawText = chunkResponses[0]?.rawText || "";
-      finalPrompt = chunkResponses[0]?.prompt || "";
-    } else {
-      const combinedPrompt = `
-Date: ${date}
-Repository: ${REPO}
-Total commits: ${commits.length}
-Type breakdown (authoritative): ${JSON.stringify(buildTypeBreakdown(commits))}
-Chunk summaries (for context):
-${chunkSummaries
-  .map(
-    (summary, idx) =>
-      `${idx + 1}. Summary: ${summary.summary}\nHighlights: ${
-        summary.highlights?.join("; ") || "n/a"
-      }\nRisks: ${summary.risks?.join("; ") || "n/a"}`
-  )
-  .join("\n\n")}
-
-Guidelines:
-- Provide 6-10 highlights describing distinct themes (not individual commits).
-- Avoid listing raw commit titles.
-- Use concrete terms like folder names, tools, features, or config areas.
-- Do not use the word "update" or "updates".
-
-Return JSON only with this shape:
-${summaryShape}
-Return a single valid JSON object only. Do not wrap it in markdown code fences.
-`;
-
-      const response = await callModel({
-        prompt: combinedPrompt,
-        maxTokens: SUMMARY_MAX_TOKENS,
-        overrideSystem:
-          systemPrompt +
-          " Return ONLY a valid JSON object. Do not include analysis or reasoning.",
-      });
-
-      rawText = response.content
-        ?.filter((block) => block.type === "text")
-        .map((block) => block.text)
-        .join("\n")
-        .trim();
-
-      parsed = parseAiResponse(rawText || "", commits);
-      if (parsed) {
-        parsed.type_breakdown = buildTypeBreakdown(commits);
-      }
-      finalPrompt = combinedPrompt.trim();
-    }
-
-    if (parsed) {
-      parsed.type_breakdown = buildTypeBreakdown(commits);
-      const minHighlights = 6;
-      const existingHighlights = Array.isArray(parsed.highlights)
-        ? parsed.highlights
-        : [];
-      let mergedHighlights = [...existingHighlights];
-
-      if (mergedHighlights.length < minHighlights && chunkSummaries.length > 1) {
-        const chunkHighlights = chunkSummaries
-          .map((summary) => summary.summary)
-          .filter(Boolean)
-          .filter((text) => text !== parsed.summary);
-        mergedHighlights = mergedHighlights.concat(chunkHighlights);
-      }
-
-      if (mergedHighlights.length < minHighlights) {
-        mergedHighlights = mergedHighlights.concat(
-          buildThemeHighlights(commits, minHighlights)
-        );
-      }
-
-      const deduped = [];
-      const seen = new Set();
-      for (const item of mergedHighlights) {
-        const normalized = String(item).trim();
-        if (!normalized) continue;
-        const key = normalized.toLowerCase();
-        if (seen.has(key)) continue;
-        seen.add(key);
-        deduped.push(normalized);
-      }
-      parsed.highlights = deduped.slice(0, Math.max(minHighlights, deduped.length));
-    }
-
-    const responseSnapshot = {
-      attempts,
-      chunks: chunkSummaries.length,
-      chunkResponses,
-    };
-
-    const payload = {
-      summary: parsed || null,
-      raw: rawText,
-      cache: { source: "minimax", chunks: chunkSummaries.length },
-    };
-
-    dbRun(
-      `
-      INSERT INTO daily_summaries (
-        repo, date, fingerprint, summary_json, raw_text,
-        prompt_text, response_text, response_json, updated_at
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(repo, date) DO UPDATE SET
-        fingerprint = excluded.fingerprint,
-        summary_json = excluded.summary_json,
-        raw_text = excluded.raw_text,
-        prompt_text = excluded.prompt_text,
-        response_text = excluded.response_text,
-        response_json = excluded.response_json,
-        updated_at = excluded.updated_at
-    `,
-      [
-        REPO,
-        date,
-        fingerprint,
-        parsed ? JSON.stringify(parsed) : null,
-        rawText,
-        finalPrompt || "",
-        rawText,
-        JSON.stringify(responseSnapshot),
-        new Date().toISOString(),
-      ]
-    );
-    persistDb();
-
-    if (debug) {
-      payload.debug = {
-        prompt: finalPrompt || "",
-        responseText: rawText,
-        responseJson: responseSnapshot,
-      };
-    }
+    const payload = await createSummaryPayload({ date, commits, force, debug });
     res.json(payload);
   } catch (error) {
-    res.status(500).json({
-      error: "AI summary failed",
+    if (error.status === 503) {
+      return res.status(503).json({
+        error: "AI summary not configured",
+        details: "Set ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL",
+      });
+    }
+    res.status(error.status || 500).json({
+      error: error.status === 400 ? error.message : "AI summary failed",
       details: error.message,
     });
   }
