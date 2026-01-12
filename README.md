@@ -1,11 +1,11 @@
 # Clawdbot Daily
 
-Executive-friendly daily summaries of the `clawdbot/clawdbot` repository.
+Lobster-grade daily summaries of the `clawdbot/clawdbot` repository. 🦞
 
 ## What it does
-- Pulls commits from GitHub for a date range.
-- Groups them by day and renders a CTO/CEO-ready brief.
-- Uses MiniMax (Anthropic-compatible) to generate concise AI summaries per day.
+- Pulls commits, issues, and pull requests from GitHub and groups them by day.
+- Renders a fast, clean daily log with a “commit summary” activity feed.
+- Uses MiniMax (Anthropic-compatible) to generate AI summaries per day.
 
 ## Local setup
 ```bash
@@ -23,13 +23,18 @@ Then open `http://localhost:3000`.
 - `GITHUB_REPO` (optional): defaults to `clawdbot/clawdbot`.
 - `GITHUB_BRANCH` (optional): defaults to `main`.
 - `GITHUB_TOKEN` (optional): increases GitHub rate limits.
+- `CACHE_DB_PATH` (optional): SQLite location (default `./data/clawdbotnews.sqlite`).
+- `SYNC_INTERVAL_MINUTES` (optional): how often GitHub is polled (default `10`).
+- `MAX_COMMITS_PER_PROMPT` (optional): commit threshold before chunking (default `2000`).
+- `CHUNK_SIZE` (optional): commits per chunk when chunking is needed (default `200`).
+- `SUMMARY_MAX_TOKENS` (optional): AI summary output cap (default `1200`).
 
 ## Notes
 - Without `ANTHROPIC_API_KEY`, the UI still renders commit history but AI summaries are disabled.
 - GitHub API rate limits apply. Add `GITHUB_TOKEN` for higher limits.
-- Commit data and AI summaries are cached in SQLite for faster reloads and to avoid rate limits.
+- Commit data, issues/PRs, and AI summaries are cached in SQLite for faster reloads.
 - SQLite runs via `sql.js` (WASM), so there is no native build step.
-- New commits are synced incrementally; set `SYNC_INTERVAL_MINUTES` to control how often GitHub is polled.
+- New items are synced incrementally; set `SYNC_INTERVAL_MINUTES` to control how often GitHub is polled.
 
 ## Debugging summaries
 Use `/api/summary?date=YYYY-MM-DD` to fetch the cached prompt + model response for a given day.
