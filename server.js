@@ -35,8 +35,9 @@ const AI_KEY = process.env.ANTHROPIC_API_KEY;
 const MAX_COMMITS_PER_PROMPT = Number(
   process.env.MAX_COMMITS_PER_PROMPT || 2000
 );
-const CHUNK_SIZE = Number(process.env.CHUNK_SIZE || 200);
+const CHUNK_SIZE = Number(process.env.CHUNK_SIZE || 80);
 const SUMMARY_MAX_TOKENS = Number(process.env.SUMMARY_MAX_TOKENS || 1200);
+const SUMMARY_FILE_COMMITS = Number(process.env.SUMMARY_FILE_COMMITS || 8);
 
 const summarizer = AI_KEY
   ? new Anthropic({
@@ -352,6 +353,28 @@ function mapCommitNode(node) {
   };
 }
 
+function selectTopCommits(commits, limit) {
+  return [...commits]
+    .filter((commit) => commit?.sha)
+    .sort((a, b) => (b.stats?.total || 0) - (a.stats?.total || 0))
+    .slice(0, limit);
+}
+
+async function enrichCommitFiles(commits, limit) {
+  const targets = selectTopCommits(commits, limit).filter(
+    (commit) => !Array.isArray(commit.files) || commit.files.length === 0
+  );
+  for (const commit of targets) {
+    try {
+      const detail = await ghFetch(`${GH_BASE}/commits/${commit.sha}`);
+      const mapped = mapCommitDetail(detail);
+      commit.files = mapped.files || [];
+    } catch (error) {
+      console.warn(`Failed to enrich files for ${commit.sha}:`, error.message);
+    }
+  }
+}
+
 function mapIssue(item) {
   return {
     id: item.id,
@@ -397,6 +420,7 @@ function groupByDateKey(items, dateKey) {
 function normalizeCommitsForPrompt(commits) {
   return commits.map((commit) => ({
     sha: commit.shortSha,
+    fullSha: commit.sha,
     title: commit.title,
     type: commit.type,
     additions: commit.stats?.additions ?? 0,
@@ -405,11 +429,17 @@ function normalizeCommitsForPrompt(commits) {
   }));
 }
 
-function formatCommitLines(commits, { includeFiles = true } = {}) {
+function formatCommitLines(
+  commits,
+  { includeFiles = true, filesForShas = null } = {}
+) {
   return normalizeCommitsForPrompt(commits)
     .map((commit, index) => {
+      const allowFiles =
+        includeFiles &&
+        (!filesForShas || (commit.fullSha && filesForShas.has(commit.fullSha)));
       const fileText =
-        includeFiles && commit.files.length
+        allowFiles && commit.files.length
           ? ` | files: ${commit.files.join(", ")}`
           : "";
       return `${index + 1}. [${commit.sha}] ${commit.title} | type: ${
@@ -505,8 +535,8 @@ function buildFallbackSummary(commits) {
     { key: "telegram", label: "Telegram command handling" },
     { key: "plugin", label: "Plugin architecture" },
     { key: "dm", label: "Direct message history limits" },
-    { key: "changelog", label: "Changelog updates" },
-    { key: "docs", label: "Documentation updates" },
+    { key: "changelog", label: "Changelog entries" },
+    { key: "docs", label: "Documentation" },
     { key: "test", label: "Testing coverage" },
   ];
 
@@ -525,7 +555,7 @@ function buildFallbackSummary(commits) {
     .map(([label]) => label);
 
   const summaryThemes =
-    topThemes.length > 0 ? topThemes.join(" and ") : "core platform changes";
+    topThemes.length > 0 ? topThemes.join(" and ") : "core platform work";
   const summary = `Focused on ${summaryThemes} with ${total} commits (${breakdown.feature} features, ${breakdown.fix} fixes, ${breakdown.refactor} refactors).`;
 
   const highlights = commits
@@ -552,7 +582,7 @@ function buildThemeHighlights(commits, maxItems = 6) {
     { key: "telegram", label: "Telegram integration" },
     { key: "plugin", label: "Plugin architecture" },
     { key: "dm", label: "Direct message history limits" },
-    { key: "docs", label: "Documentation updates" },
+    { key: "docs", label: "Documentation" },
     { key: "test", label: "Testing coverage" },
     { key: "config", label: "Configuration management" },
     { key: "release", label: "Release tooling" },
@@ -573,7 +603,7 @@ function buildThemeHighlights(commits, maxItems = 6) {
   return Array.from(counts.entries())
     .sort((a, b) => b[1] - a[1])
     .slice(0, maxItems)
-    .map(([label, count]) => `${label} updates (${count} commits).`);
+    .map(([label, count]) => `${label} work (${count} commits).`);
 }
 
 function parseAiResponse(rawText, commits) {
@@ -1214,10 +1244,12 @@ app.post("/api/summarize", async (req, res) => {
   const systemPrompt =
     "You are a lobster keeping a clear, friendly daily change log. " +
     "Summarize changes in plain language without corporate tone. " +
+    "Name concrete areas (folders, commands, features) instead of generic phrases. " +
+    "Avoid using the word 'update' or 'updates' unless referring to a version. " +
     "Classify work as feature, fix, refactor, docs, test, or chore. " +
     "Be concise, factual, and avoid speculation.";
 
-  const summaryShape = `{\n  \"summary\": \"1-2 sentence executive summary\",\n  \"highlights\": [\"bullet\", \"bullet\"],\n  \"type_breakdown\": { \"feature\": 0, \"fix\": 0, \"refactor\": 0, \"docs\": 0, \"test\": 0, \"chore\": 0, \"other\": 0 },\n  \"risks\": [\"short risk if any\", \"or empty array if none\"]\n}`;
+  const summaryShape = `{\n  \"summary\": \"1-2 sentence summary\",\n  \"highlights\": [\"bullet\", \"bullet\"],\n  \"type_breakdown\": { \"feature\": 0, \"fix\": 0, \"refactor\": 0, \"docs\": 0, \"test\": 0, \"chore\": 0, \"other\": 0 },\n  \"risks\": [\"short risk if any\", \"or empty array if none\"]\n}`;
 
   try {
     const attempts = [];
@@ -1256,12 +1288,18 @@ ${commitLines}
 Guidelines:
 - Provide 6-10 highlights describing distinct themes (not individual commits).
 - Avoid listing raw commit titles.
+- Use concrete terms like folder names, tools, features, or config areas.
+- Do not use the word "update" or "updates".
 
 Return JSON only with this shape:
 ${summaryShape}
 Return a single valid JSON object only. Do not wrap it in markdown code fences.
 `;
 
+    await enrichCommitFiles(commits, SUMMARY_FILE_COMMITS);
+    const filesForShas = new Set(
+      selectTopCommits(commits, SUMMARY_FILE_COMMITS).map((commit) => commit.sha)
+    );
     const chunks =
       commits.length > MAX_COMMITS_PER_PROMPT
         ? chunkArray(commits, CHUNK_SIZE)
@@ -1278,7 +1316,10 @@ Return a single valid JSON object only. Do not wrap it in markdown code fences.
         chunks.length > 1
           ? `Chunk ${index + 1} of ${chunks.length}.`
           : "";
-      const commitLines = formatCommitLines(chunk, { includeFiles: false });
+      const commitLines = formatCommitLines(chunk, {
+        includeFiles: true,
+        filesForShas,
+      });
       const chunkPrompt = makePrompt(commitLines, extraContext);
       let response = await callModel({
         prompt: chunkPrompt,
@@ -1335,6 +1376,8 @@ ${chunkSummaries
 Guidelines:
 - Provide 6-10 highlights describing distinct themes (not individual commits).
 - Avoid listing raw commit titles.
+- Use concrete terms like folder names, tools, features, or config areas.
+- Do not use the word "update" or "updates".
 
 Return JSON only with this shape:
 ${summaryShape}
