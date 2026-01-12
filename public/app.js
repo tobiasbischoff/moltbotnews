@@ -262,6 +262,15 @@ function renderTimeline(data) {
     .join("");
 }
 
+function scrollToHash() {
+  const hash = window.location.hash;
+  if (!hash || !hash.startsWith("#day-")) return;
+  const target = document.querySelector(hash);
+  if (target) {
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+
 function updateMeta(data) {
   elements.repoPill.textContent = `${data.repo} · ${data.branch}`;
   if (elements.repoLink) {
@@ -411,6 +420,7 @@ async function loadCommits(force = false) {
       error: data.cache?.error || data.cache?.issues?.error,
     });
     startStatusPolling();
+    scrollToHash();
   } catch (error) {
     renderEmpty(error.message || "Unable to load commits.");
   }
