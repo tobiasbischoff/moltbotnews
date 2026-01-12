@@ -526,6 +526,17 @@ function extractSummaryLine(text) {
   return firstLine ? firstLine.trim() : "";
 }
 
+function guessHighlightType(text = "") {
+  const value = String(text).toLowerCase();
+  if (value.includes("fix") || value.includes("bug")) return "fix";
+  if (value.includes("refactor")) return "refactor";
+  if (value.includes("doc")) return "docs";
+  if (value.includes("test")) return "test";
+  if (value.includes("chore")) return "chore";
+  if (value.includes("feature") || value.includes("add")) return "feature";
+  return "update";
+}
+
 function buildFallbackSummary(commits) {
   const breakdown = buildTypeBreakdown(commits);
   const total = commits.length;
@@ -780,6 +791,53 @@ function isGenericHighlight(text = "") {
   );
 }
 
+function buildConcreteHighlightObjects(commits, maxItems = 6) {
+  const buckets = new Map();
+  for (const commit of commits) {
+    const theme = detectTheme(commit);
+    if (!buckets.has(theme)) buckets.set(theme, []);
+    buckets.get(theme).push(commit);
+  }
+
+  const ranked = Array.from(buckets.entries())
+    .map(([theme, items]) => ({
+      theme,
+      items,
+      score: items.reduce((sum, item) => sum + (item.stats?.total || 0), 0),
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxItems);
+
+  return ranked.map(({ theme, items }) => {
+    const top = [...items].sort(
+      (a, b) => (b.stats?.total || 0) - (a.stats?.total || 0)
+    );
+    const titleBits = top
+      .slice(0, 2)
+      .map((item) => sanitizeCommitTitle(item.title || ""))
+      .filter(Boolean);
+    const fileHint = extractFileHint(
+      (top[0]?.files || []).map((file) =>
+        typeof file === "string" ? file : file.filename || ""
+      )
+    );
+    const typeCounts = top.reduce((acc, item) => {
+      const t = item.type || "other";
+      acc[t] = (acc[t] || 0) + 1;
+      return acc;
+    }, {});
+    const type = Object.entries(typeCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || "update";
+    const detail = titleBits.length
+      ? titleBits.join(" + ")
+      : "Key changes across core files";
+    return {
+      type,
+      what: `${theme}: ${detail}`,
+      where: fileHint || "",
+    };
+  });
+}
+
 function getCachedSummaryRow(date) {
   return dbGet(
     `
@@ -839,7 +897,7 @@ async function createSummaryPayload({ date, commits, force = false, debug = fals
     "Classify work as feature, fix, refactor, docs, test, or chore. " +
     "Be concise, factual, and avoid speculation.";
 
-  const summaryShape = `{\n  \"summary\": \"1-2 sentence summary\",\n  \"highlights\": [\"bullet\", \"bullet\"],\n  \"type_breakdown\": { \"feature\": 0, \"fix\": 0, \"refactor\": 0, \"docs\": 0, \"test\": 0, \"chore\": 0, \"other\": 0 },\n  \"risks\": [\"short risk if any\", \"or empty array if none\"]\n}`;
+  const summaryShape = `{\n  \"summary\": \"1-2 sentence summary\",\n  \"highlights\": [\n    { \"type\": \"feature|fix|refactor|docs|test|chore|other\", \"what\": \"what changed\", \"where\": \"folder or file (e.g. src/config, docs/providers/minimax.md)\" }\n  ],\n  \"type_breakdown\": { \"feature\": 0, \"fix\": 0, \"refactor\": 0, \"docs\": 0, \"test\": 0, \"chore\": 0, \"other\": 0 },\n  \"risks\": [\"short risk if any\", \"or empty array if none\"]\n}`;
 
   const attempts = [];
   const callModel = async ({ overrideSystem, prompt, maxTokens }) => {
@@ -879,6 +937,7 @@ Guidelines:
 - Avoid listing raw commit titles.
 - Use concrete terms like folder names, tools, features, or config areas.
 - Do not use the word "update" or "updates".
+- For each highlight, fill in "what" and "where". "where" should be a folder or file path.
 
 Return JSON only with this shape:
 ${summaryShape}
@@ -967,6 +1026,7 @@ Guidelines:
 - Avoid listing raw commit titles.
 - Use concrete terms like folder names, tools, features, or config areas.
 - Do not use the word "update" or "updates".
+- For each highlight, fill in "what" and "where". "where" should be a folder or file path.
 
 Return JSON only with this shape:
 ${summaryShape}
@@ -1006,32 +1066,49 @@ Return a single valid JSON object only. Do not wrap it in markdown code fences.
       const chunkHighlights = chunkSummaries
         .map((summary) => summary.summary)
         .filter(Boolean)
-        .filter((text) => text !== parsed.summary);
+        .filter((text) => text !== parsed.summary)
+        .map((text) => ({
+          type: guessHighlightType(text),
+          what: text,
+          where: "",
+        }));
       mergedHighlights = mergedHighlights.concat(chunkHighlights);
     }
 
     if (mergedHighlights.length < minHighlights) {
       mergedHighlights = mergedHighlights.concat(
-        buildConcreteThemeHighlights(commits, minHighlights)
+        buildConcreteHighlightObjects(commits, minHighlights)
       );
     }
 
     const deduped = [];
     const seen = new Set();
     for (const item of mergedHighlights) {
-      const normalized = String(item).trim();
-      if (!normalized) continue;
+      const what = typeof item === "string" ? item : item.what || "";
+      const where = typeof item === "string" ? "" : item.where || "";
+      const normalized = `${what}::${where}`.trim();
+      if (!what || !normalized) continue;
       const key = normalized.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
-      deduped.push(normalized);
+      if (typeof item === "string") {
+        deduped.push({
+          type: guessHighlightType(item),
+          what: item,
+          where: "",
+        });
+      } else {
+        deduped.push(item);
+      }
     }
     let finalHighlights = deduped;
-    const genericCount = finalHighlights.filter(isGenericHighlight).length;
+    const genericCount = finalHighlights.filter((item) =>
+      isGenericHighlight(item.what || "")
+    ).length;
     if (genericCount >= Math.max(2, Math.ceil(finalHighlights.length / 2))) {
-      const concrete = buildConcreteThemeHighlights(commits, minHighlights);
+      const concrete = buildConcreteHighlightObjects(commits, minHighlights);
       const nonGeneric = finalHighlights.filter(
-        (item) => !isGenericHighlight(item)
+        (item) => !isGenericHighlight(item.what || "")
       );
       finalHighlights = [...nonGeneric, ...concrete];
     }
@@ -1129,6 +1206,34 @@ function parseAiResponse(rawText, commits) {
         : fallbackBreakdown;
     parsed.risks = Array.isArray(parsed.risks) ? parsed.risks : [];
   }
+  const normalizedHighlights = Array.isArray(parsed.highlights)
+    ? parsed.highlights
+        .map((item) => {
+          if (!item) return null;
+          if (typeof item === "string") {
+            return {
+              type: guessHighlightType(item),
+              what: item,
+              where: "",
+            };
+          }
+          const type = item.type || item.kind || item.category || "update";
+          const what =
+            item.what ||
+            item.summary ||
+            item.text ||
+            item.title ||
+            "";
+          const where = item.where || item.area || item.path || "";
+          return {
+            type: String(type).toLowerCase(),
+            what: String(what),
+            where: String(where),
+          };
+        })
+        .filter(Boolean)
+    : [];
+  parsed.highlights = normalizedHighlights;
   return parsed;
 }
 

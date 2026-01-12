@@ -445,6 +445,17 @@ function buildSummaryHtml(summary) {
     return "update";
   };
 
+  const normalizeHighlight = (item) => {
+    if (!item) return null;
+    if (typeof item === "string") {
+      return { type: guessType(item), what: item, where: "" };
+    }
+    const type = item.type || item.kind || item.category || guessType(item.what || "");
+    const what = item.what || item.text || item.title || "";
+    const where = item.where || item.area || item.path || "";
+    return { type: String(type).toLowerCase(), what, where };
+  };
+
   const rows = [];
   rows.push({
     type: "summary",
@@ -452,7 +463,13 @@ function buildSummaryHtml(summary) {
   });
 
   highlightItems.forEach((item) => {
-    rows.push({ type: guessType(item), text: item });
+    const normalized = normalizeHighlight(item);
+    if (!normalized || !normalized.what) return;
+    const whereText = normalized.where ? ` — ${normalized.where}` : "";
+    rows.push({
+      type: normalized.type || guessType(normalized.what),
+      text: `${normalized.what}${whereText}`,
+    });
   });
 
   risks.forEach((item) => {
