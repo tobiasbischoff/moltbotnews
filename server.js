@@ -659,6 +659,127 @@ function buildThemeHighlights(commits, maxItems = 6) {
     });
 }
 
+function sanitizeCommitTitle(title = "") {
+  const cleaned = String(title)
+    .replace(/^merge pull request.*$/i, "")
+    .replace(/^merge branch.*$/i, "")
+    .replace(/^(feat|fix|docs|test|chore|refactor|perf|style)(\([^)]+\))?:\s*/i, "")
+    .trim();
+  return cleaned || title.trim();
+}
+
+function extractFileHint(files = []) {
+  if (!files.length) return "";
+  const pick = files.find(Boolean) || "";
+  const parts = pick.split("/");
+  if (parts.length >= 2) {
+    return `${parts[0]}/${parts[1]}`;
+  }
+  return parts[0] || "";
+}
+
+function detectTheme(commit) {
+  const title = (commit.title || "").toLowerCase();
+  const files = (commit.files || []).map((file) =>
+    typeof file === "string" ? file : file.filename || ""
+  );
+  const pathText = files.join(" ").toLowerCase();
+  if (pathText.includes("docs/") || title.includes("docs") || title.includes("readme")) {
+    return "Docs";
+  }
+  if (
+    pathText.includes(".github/") ||
+    title.includes("ci") ||
+    title.includes("pipeline") ||
+    title.includes("workflow")
+  ) {
+    return "CI";
+  }
+  if (pathText.includes("src/config") || title.includes("config")) {
+    return "Config";
+  }
+  if (pathText.includes("src/plugins") || pathText.includes("extensions") || title.includes("plugin")) {
+    return "Plugins";
+  }
+  if (pathText.includes("src/cli") || title.includes("cli") || title.includes("command")) {
+    return "CLI";
+  }
+  if (
+    pathText.includes("ui/") ||
+    pathText.includes("apps/macos") ||
+    title.includes("ui") ||
+    title.includes("wizard")
+  ) {
+    return "UI";
+  }
+  if (pathText.includes("src/agents") || title.includes("agent")) {
+    return "Agents";
+  }
+  if (pathText.includes("src/gateway") || title.includes("gateway")) {
+    return "Gateway";
+  }
+  if (pathText.includes("providers") || title.includes("provider") || title.includes("moonshot")) {
+    return "Providers";
+  }
+  if (title.includes("test") || pathText.includes(".test.")) {
+    return "Tests";
+  }
+  return "Other";
+}
+
+function buildConcreteThemeHighlights(commits, maxItems = 6) {
+  const buckets = new Map();
+  for (const commit of commits) {
+    const theme = detectTheme(commit);
+    if (!buckets.has(theme)) buckets.set(theme, []);
+    buckets.get(theme).push(commit);
+  }
+
+  const ranked = Array.from(buckets.entries())
+    .map(([theme, items]) => ({
+      theme,
+      items,
+      score: items.reduce((sum, item) => sum + (item.stats?.total || 0), 0),
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxItems);
+
+  return ranked.map(({ theme, items }) => {
+    const top = [...items].sort(
+      (a, b) => (b.stats?.total || 0) - (a.stats?.total || 0)
+    );
+    const titleBits = top
+      .slice(0, 2)
+      .map((item) => sanitizeCommitTitle(item.title || ""))
+      .filter(Boolean);
+    const fileHint = extractFileHint(
+      (top[0]?.files || []).map((file) =>
+        typeof file === "string" ? file : file.filename || ""
+      )
+    );
+    const detail = titleBits.length
+      ? titleBits.join(" + ")
+      : "Key changes across core files";
+    const hintText = fileHint ? ` (${fileHint})` : "";
+    return `${theme}: ${detail}${hintText}.`;
+  });
+}
+
+function isGenericHighlight(text = "") {
+  const value = text.toLowerCase();
+  if (!value.includes("commits")) return false;
+  return (
+    value.startsWith("docs") ||
+    value.startsWith("tests") ||
+    value.startsWith("config") ||
+    value.startsWith("plugins") ||
+    value.startsWith("cli") ||
+    value.startsWith("ci") ||
+    value.startsWith("documentation") ||
+    value.startsWith("testing")
+  );
+}
+
 function getCachedSummaryRow(date) {
   return dbGet(
     `
@@ -891,7 +1012,7 @@ Return a single valid JSON object only. Do not wrap it in markdown code fences.
 
     if (mergedHighlights.length < minHighlights) {
       mergedHighlights = mergedHighlights.concat(
-        buildThemeHighlights(commits, minHighlights)
+        buildConcreteThemeHighlights(commits, minHighlights)
       );
     }
 
@@ -905,7 +1026,19 @@ Return a single valid JSON object only. Do not wrap it in markdown code fences.
       seen.add(key);
       deduped.push(normalized);
     }
-    parsed.highlights = deduped.slice(0, Math.max(minHighlights, deduped.length));
+    let finalHighlights = deduped;
+    const genericCount = finalHighlights.filter(isGenericHighlight).length;
+    if (genericCount >= Math.max(2, Math.ceil(finalHighlights.length / 2))) {
+      const concrete = buildConcreteThemeHighlights(commits, minHighlights);
+      const nonGeneric = finalHighlights.filter(
+        (item) => !isGenericHighlight(item)
+      );
+      finalHighlights = [...nonGeneric, ...concrete];
+    }
+    parsed.highlights = finalHighlights.slice(
+      0,
+      Math.max(minHighlights, finalHighlights.length)
+    );
   }
 
   const responseSnapshot = {
