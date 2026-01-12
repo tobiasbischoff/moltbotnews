@@ -1414,6 +1414,41 @@ function getCommitAi(sha) {
   return row || null;
 }
 
+function getSummaryFingerprint(dateKey) {
+  const row = dbGet(
+    `
+    SELECT fingerprint
+    FROM daily_summaries
+    WHERE repo = ? AND date = ?
+  `,
+    [REPO, dateKey]
+  );
+  if (!row?.fingerprint) return new Set();
+  return new Set(row.fingerprint.split("|").filter(Boolean));
+}
+
+async function ensureCommitAiForDate(dateKey, commits = null) {
+  if (!summarizer) return;
+  const list = commits || loadCommitsForDate(dateKey);
+  const pending = list.filter((commit) => !getCommitAi(commit.sha));
+  if (!pending.length) return;
+  const generated = await runWithConcurrency(
+    pending,
+    SUMMARY_CONCURRENCY,
+    async (commit) => classifyCommitWithAi(commit)
+  );
+  cacheCommitAi(generated);
+}
+
+function countQualifiedNewCommits(commits, summarySet) {
+  let count = 0;
+  for (const commit of commits) {
+    if (summarySet.has(commit.sha)) continue;
+    if (getCommitAi(commit.sha)) count += 1;
+  }
+  return count;
+}
+
 function cacheCommitAi(entries) {
   if (!entries.length) return;
   const now = new Date().toISOString();
@@ -1634,12 +1669,24 @@ function scheduleSummaryForDate(dateKey) {
   if (summaryJobs.has(dateKey)) return;
   const commits = loadCommitsForDate(dateKey);
   if (!commits.length) return;
-  const fingerprint = commits.map((commit) => commit.sha).join("|");
   const cached = getCachedSummaryRow(dateKey);
-  if (cached && cached.fingerprint === fingerprint) return;
+  const summarySet = cached?.fingerprint
+    ? new Set(cached.fingerprint.split("|"))
+    : new Set();
+  const newQualified = countQualifiedNewCommits(commits, summarySet);
+  if (newQualified < 10) {
+    ensureCommitAiForDate(dateKey, commits).catch((error) => {
+      console.warn(`Commit AI failed for ${dateKey}:`, error.message);
+    });
+    return;
+  }
 
   const job = (async () => {
     try {
+      await ensureCommitAiForDate(dateKey, commits);
+      const updatedSet = getSummaryFingerprint(dateKey);
+      const qualifiedAfter = countQualifiedNewCommits(commits, updatedSet);
+      if (qualifiedAfter < 10) return;
       await createSummaryPayload({ date: dateKey, commits });
     } catch (error) {
       console.warn(`Summary job failed for ${dateKey}:`, error.message);

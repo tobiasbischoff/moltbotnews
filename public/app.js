@@ -176,16 +176,6 @@ function buildDayCard(day, index) {
             <span><span class="delta-plus">+${additions}</span> / <span class="delta-minus">-${deletions}</span></span>
           </div>
         </div>
-        <div class="ai-actions">
-          <button
-            class="btn ghost"
-            data-action="regenerate-day"
-            data-date="${day.date}"
-            ${aiEnabled ? "" : "disabled"}
-          >
-            Regenerate
-          </button>
-        </div>
       </div>
       <div class="ai-box" data-ai-box="${day.date}">
         <div class="ai-header">
@@ -562,15 +552,6 @@ async function summarizeAll(force = false) {
     await summarizeDay(day.date, force);
   }
 }
-
-elements.timeline.addEventListener("click", (event) => {
-  const button = event.target.closest("button[data-action]");
-  if (!button) return;
-  const action = button.dataset.action;
-  if (action === "regenerate-day") {
-    summarizeDay(button.dataset.date, true);
-  }
-});
 
 if (elements.syncPill) {
   elements.syncPill.addEventListener("click", () => {
