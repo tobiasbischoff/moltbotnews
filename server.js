@@ -2099,14 +2099,26 @@ app.get("/feed.xml", (req, res) => {
     const bucketText = buckets.length
       ? buckets.map((bucket) => `• ${bucket.label.toUpperCase()}: ${bucket.text}`).join("\n")
       : "";
-    const description = `${summaryText}\n\n${bucketText}\n\nCommits: ${
-      day.commits.length
-    } (+${additions} / -${deletions})`;
+    const bucketHtml = buckets.length
+      ? `<ul>${buckets
+          .map(
+            (bucket) =>
+              `<li><strong>${escapeXml(
+                bucket.label.toUpperCase()
+              )}:</strong> ${escapeXml(bucket.text)}</li>`
+          )
+          .join("")}</ul>`
+      : "";
+    const description = `
+${summaryText}
+${bucketHtml}
+<p><strong>Commits:</strong> ${day.commits.length} (+${additions} / -${deletions})</p>
+    `.trim();
     const pubDate = formatRssDate(`${day.date}T12:00:00.000Z`);
     return `
       <item>
         <title>${escapeXml(title)}</title>
-        <link>${escapeXml(baseUrl)}</link>
+        <link>${escapeXml(`${baseUrl}#day-${day.date}`)}</link>
         <guid isPermaLink="false">${escapeXml(`${REPO}:${BRANCH}:${day.date}`)}</guid>
         <pubDate>${escapeXml(pubDate)}</pubDate>
         <description>${wrapCdata(description)}</description>

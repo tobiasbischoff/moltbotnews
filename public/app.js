@@ -167,7 +167,7 @@ function buildDayCard(day, index) {
     `
     : "";
   return `
-    <article class="day-card" style="--delay: ${index * 0.05}s">
+    <article class="day-card" id="day-${day.date}" style="--delay: ${index * 0.05}s">
       <div class="day-header">
         <div>
           <div class="day-title">${formatDate(day.date)}</div>
