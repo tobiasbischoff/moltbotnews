@@ -364,14 +364,33 @@ body {
   white-space: nowrap;
 }
 
+.ai-tag.summary {
+  background: rgba(243, 201, 122, 0.18);
+  color: var(--gold);
+  border-color: rgba(243, 201, 122, 0.35);
+}
+
+.ai-tag.feature {
+  background: rgba(74, 216, 183, 0.18);
+  color: var(--seafoam);
+  border-color: rgba(74, 216, 183, 0.35);
+}
+
+.ai-tag.update {
+  background: rgba(108, 93, 255, 0.18);
+  color: #b7a7ff;
+  border-color: rgba(108, 93, 255, 0.35);
+}
+
 .ai-tag.fix {
   background: rgba(232, 106, 71, 0.22);
   color: #f6b29f;
 }
 
 .ai-tag.refactor {
-  background: rgba(74, 216, 183, 0.18);
-  color: var(--seafoam);
+  background: rgba(244, 114, 182, 0.18);
+  color: #f9a8d4;
+  border-color: rgba(244, 114, 182, 0.35);
 }
 
 .ai-tag.docs {
@@ -381,8 +400,9 @@ body {
 
 .ai-tag.chore,
 .ai-tag.test {
-  background: rgba(108, 93, 255, 0.18);
-  color: #b7a7ff;
+  background: rgba(88, 166, 255, 0.18);
+  color: #8cc8ff;
+  border-color: rgba(88, 166, 255, 0.35);
 }
 
 .ai-tag.risk {

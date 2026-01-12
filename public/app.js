@@ -6,13 +6,7 @@ const state = {
 const elements = {
   timeline: document.getElementById("timeline"),
   loadingCard: document.getElementById("loadingCard"),
-  lastUpdated: document.getElementById("lastUpdated"),
-  aiStatus: document.getElementById("aiStatus"),
   repoPill: document.getElementById("repoPill"),
-  refreshBtn: document.getElementById("refreshBtn"),
-  summarizeAllBtn: document.getElementById("summarizeAllBtn"),
-  regenerateAllBtn: document.getElementById("regenerateAllBtn"),
-  helperText: document.getElementById("helperText"),
 };
 
 function escapeHtml(value) {
@@ -84,14 +78,6 @@ function buildDayCard(day, index) {
         <div class="ai-actions">
           <button
             class="btn ghost"
-            data-action="summarize-day"
-            data-date="${day.date}"
-            ${aiEnabled ? "" : "disabled"}
-          >
-            Summarize day
-          </button>
-          <button
-            class="btn ghost"
             data-action="regenerate-day"
             data-date="${day.date}"
             ${aiEnabled ? "" : "disabled"}
@@ -109,7 +95,7 @@ function buildDayCard(day, index) {
           <p>
             ${
               aiEnabled
-                ? "Generate an executive summary for this day’s changes."
+                ? "🦞 Generate the lobster log for this day’s changes."
                 : "AI summaries are disabled until the API key is configured."
             }
           </p>
@@ -177,17 +163,7 @@ function renderTimeline(data) {
 }
 
 function updateMeta(data) {
-  elements.lastUpdated.textContent = new Date().toLocaleString("en-US", {
-    dateStyle: "medium",
-    timeStyle: "short",
-  });
-  elements.aiStatus.textContent = data.aiAvailable ? "Enabled" : "Disabled";
   elements.repoPill.textContent = `${data.repo} · ${data.branch}`;
-  elements.helperText.textContent = data.aiAvailable
-    ? "AI summaries powered by MiniMax (Anthropic mode)."
-    : "AI summaries are disabled until ANTHROPIC_API_KEY is set.";
-  elements.summarizeAllBtn.disabled = !data.aiAvailable;
-  elements.regenerateAllBtn.disabled = !data.aiAvailable;
 }
 
 async function loadCommits(force = false) {
@@ -287,7 +263,7 @@ async function summarizeDay(date, force = false) {
   const aiContent = aiBox.querySelector(".ai-content");
 
   aiStatus.textContent = force ? "Refreshing…" : "Summarizing…";
-  aiContent.innerHTML = "<p>Generating a concise executive summary.</p>";
+  aiContent.innerHTML = "<p>🦞 Cooking the lobster log…</p>";
 
   try {
     const response = await fetch("/api/summarize", {
@@ -326,16 +302,11 @@ async function summarizeAll(force = false) {
   }
 }
 
-elements.refreshBtn.addEventListener("click", () => loadCommits(true));
-elements.summarizeAllBtn.addEventListener("click", summarizeAll);
-elements.regenerateAllBtn.addEventListener("click", () => summarizeAll(true));
 elements.timeline.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-action]");
   if (!button) return;
   const action = button.dataset.action;
-  if (action === "summarize-day") {
-    summarizeDay(button.dataset.date);
-  } else if (action === "regenerate-day") {
+  if (action === "regenerate-day") {
     summarizeDay(button.dataset.date, true);
   }
 });

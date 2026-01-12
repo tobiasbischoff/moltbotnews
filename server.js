@@ -903,8 +903,8 @@ app.post("/api/summarize", async (req, res) => {
   }
 
   const systemPrompt =
-    "You are an engineering director briefing a CTO/CEO. " +
-    "Summarize daily changes in clear business-friendly language. " +
+    "You are a lobster keeping a clear, friendly daily change log. " +
+    "Summarize changes in plain language without corporate tone. " +
     "Classify work as feature, fix, refactor, docs, test, or chore. " +
     "Be concise, factual, and avoid speculation.";
 
