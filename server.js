@@ -1673,8 +1673,18 @@ function scheduleSummaryForDate(dateKey) {
   const summarySet = cached?.fingerprint
     ? new Set(cached.fingerprint.split("|"))
     : new Set();
+  const currentFingerprint = commits.map((commit) => commit.sha).join("|");
+  const hasSummary = Boolean(cached?.summary_json);
+  const isStale =
+    Boolean(hasSummary && cached?.fingerprint) &&
+    cached.fingerprint !== currentFingerprint;
+  const todayKey = new Date().toISOString().split("T")[0];
+  const isPast = dateKey < todayKey;
   const newQualified = countQualifiedNewCommits(commits, summarySet);
-  if (newQualified < 10) {
+  const shouldFinalize = isPast && (!hasSummary || isStale);
+  const shouldRefreshToday = !shouldFinalize && dateKey === todayKey && newQualified >= 10;
+
+  if (!shouldFinalize && !shouldRefreshToday) {
     ensureCommitAiForDate(dateKey, commits).catch((error) => {
       console.warn(`Commit AI failed for ${dateKey}:`, error.message);
     });
@@ -1684,9 +1694,11 @@ function scheduleSummaryForDate(dateKey) {
   const job = (async () => {
     try {
       await ensureCommitAiForDate(dateKey, commits);
-      const updatedSet = getSummaryFingerprint(dateKey);
-      const qualifiedAfter = countQualifiedNewCommits(commits, updatedSet);
-      if (qualifiedAfter < 10) return;
+      if (!shouldFinalize) {
+        const updatedSet = getSummaryFingerprint(dateKey);
+        const qualifiedAfter = countQualifiedNewCommits(commits, updatedSet);
+        if (qualifiedAfter < 10) return;
+      }
       await createSummaryPayload({ date: dateKey, commits });
     } catch (error) {
       console.warn(`Summary job failed for ${dateKey}:`, error.message);
@@ -1922,6 +1934,7 @@ app.get("/api/commits", async (req, res) => {
       summary: summariesByDate.get(day.date)?.summary || null,
       summaryFingerprint: summariesByDate.get(day.date)?.fingerprint || null,
     }));
+    daysWithExtras.forEach((day) => scheduleSummaryForDate(day.date));
     const initializing =
       responseCommits.length === 0 && (sync.pending || sync.timeout);
 
