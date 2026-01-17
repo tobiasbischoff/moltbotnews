@@ -591,6 +591,73 @@ details[open] .info-caret {
   border-color: rgba(232, 106, 71, 0.6);
 }
 
+.release-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 14px;
+}
+
+.release-item {
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(20, 17, 15, 0.35);
+}
+
+.release-title {
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.release-title a {
+  color: var(--ink);
+  text-decoration: none;
+  border-bottom: 1px solid rgba(232, 106, 71, 0.2);
+}
+
+.release-title a:hover {
+  color: var(--accent);
+  border-color: rgba(232, 106, 71, 0.6);
+}
+
+.release-notes {
+  display: grid;
+  gap: 10px;
+  color: var(--ink-soft);
+  font-size: 0.92rem;
+}
+
+.release-section {
+  display: grid;
+  gap: 6px;
+}
+
+.release-label {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.72rem;
+  color: var(--gold);
+  font-weight: 600;
+}
+
+.release-section.breaking .release-label {
+  color: #f29b8c;
+}
+
+.release-section ul {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
+}
+
+.release-empty {
+  color: var(--ink-soft);
+  margin: 0;
+}
+
 
 .footer {
   padding: 20px 6vw 40px;

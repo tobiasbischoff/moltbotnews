@@ -28,6 +28,7 @@ Then open `http://localhost:3000`.
 - `MAX_COMMITS_PER_PROMPT` (optional): commit threshold before chunking (default `2000`).
 - `CHUNK_SIZE` (optional): commits per chunk when chunking is needed (default `200`).
 - `SUMMARY_MAX_TOKENS` (optional): AI summary output cap (default `1200`).
+- `DB_PERSIST_DEBOUNCE_MS` (optional): debounce for SQLite export-to-disk (default `1000`).
 
 ## Notes
 - Without `ANTHROPIC_API_KEY`, the UI still renders commit history but AI summaries are disabled.

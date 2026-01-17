@@ -28,6 +28,9 @@ const CACHE_DB_PATH =
   process.env.CACHE_DB_PATH ||
   path.join(__dirname, "data", "clawdbotnews.sqlite");
 const CACHE_SCHEMA_VERSION = "2";
+const DB_PERSIST_DEBOUNCE_MS = Number(
+  process.env.DB_PERSIST_DEBOUNCE_MS || 1000
+);
 
 const AI_MODEL = process.env.ANTHROPIC_MODEL || "MiniMax-M2.1";
 const AI_BASE_URL = process.env.ANTHROPIC_BASE_URL;
@@ -94,6 +97,20 @@ db.run(`
     ON issues (repo, created_at DESC);
   CREATE INDEX IF NOT EXISTS issues_repo_ispr_created
     ON issues (repo, is_pr, created_at DESC);
+  CREATE TABLE IF NOT EXISTS releases (
+    id INTEGER PRIMARY KEY,
+    repo TEXT NOT NULL,
+    tag_name TEXT,
+    name TEXT,
+    url TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    published_at TEXT,
+    data TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS releases_repo_published
+    ON releases (repo, published_at DESC);
+  CREATE INDEX IF NOT EXISTS releases_repo_created
+    ON releases (repo, created_at DESC);
   CREATE TABLE IF NOT EXISTS daily_summaries (
     repo TEXT NOT NULL,
     date TEXT NOT NULL,
@@ -122,14 +139,39 @@ db.run(`
 `);
 
 let saveTimer = null;
-function persistDb() {
-  if (saveTimer) return;
+function persistDb({ immediate = false } = {}) {
+  if (immediate) {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+    const data = db.export();
+    fs.writeFileSync(CACHE_DB_PATH, Buffer.from(data));
+    return;
+  }
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+  }
   saveTimer = setTimeout(() => {
     saveTimer = null;
     const data = db.export();
     fs.writeFileSync(CACHE_DB_PATH, Buffer.from(data));
-  }, 150);
+  }, DB_PERSIST_DEBOUNCE_MS);
 }
+
+process.on("beforeExit", () => {
+  persistDb({ immediate: true });
+});
+
+process.on("SIGINT", () => {
+  persistDb({ immediate: true });
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  persistDb({ immediate: true });
+  process.exit(0);
+});
 
 function ensureSummaryColumns() {
   const columns = dbAll("PRAGMA table_info(daily_summaries)").map(
@@ -408,6 +450,22 @@ function mapIssue(item) {
   };
 }
 
+function mapRelease(item) {
+  const publishedAt = item.published_at || null;
+  const createdAt = item.created_at || publishedAt || null;
+  return {
+    id: item.id,
+    tag_name: item.tag_name || "",
+    name: item.name || "",
+    url: item.html_url,
+    body: item.body || "",
+    created_at: createdAt,
+    published_at: publishedAt,
+    prerelease: Boolean(item.prerelease),
+    draft: Boolean(item.draft),
+  };
+}
+
 function groupByDate(commits) {
   const grouped = new Map();
   for (const commit of commits) {
@@ -496,6 +554,61 @@ function extractJsonFromCodeFence(text) {
   } catch {
     return null;
   }
+}
+
+function extractMarkdownSection(text, headingPattern) {
+  const regex = new RegExp(
+    `(^|\\n)#{1,6}\\s*${headingPattern}\\s*\\n([\\s\\S]*?)(?=\\n#{1,6}\\s|$)`,
+    "i"
+  );
+  const match = String(text || "").match(regex);
+  return match ? match[2].trim() : "";
+}
+
+function markdownSectionToItems(section) {
+  if (!section) return [];
+  const lines = section.split(/\r?\n/);
+  const items = [];
+  let buffer = [];
+  const flush = () => {
+    if (!buffer.length) return;
+    items.push(buffer.join(" "));
+    buffer = [];
+  };
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flush();
+      continue;
+    }
+    if (trimmed.startsWith("#")) {
+      flush();
+      continue;
+    }
+    const bulletMatch = trimmed.match(/^[-*•]\s+(.*)$/);
+    const numberMatch = trimmed.match(/^\d+\.\s+(.*)$/);
+    if (bulletMatch || numberMatch) {
+      flush();
+      const item = (bulletMatch ? bulletMatch[1] : numberMatch[1]).trim();
+      if (item) items.push(item);
+      continue;
+    }
+    buffer.push(trimmed);
+  }
+  flush();
+  return items;
+}
+
+function extractReleaseSections(body = "") {
+  const highlightsSection = extractMarkdownSection(body, "highlights?");
+  const breakingSection = extractMarkdownSection(
+    body,
+    "breaking\\s*changes?|breaking"
+  );
+  return {
+    highlights: markdownSectionToItems(highlightsSection),
+    breaking: markdownSectionToItems(breakingSection),
+  };
 }
 
 function buildTypeBreakdown(commits) {
@@ -1335,10 +1448,8 @@ function getLatestCommitDate() {
 
 function cacheCommits(commits) {
   const fetchedAt = new Date().toISOString();
-  dbRun("BEGIN");
-  for (const commit of commits) {
-    dbRun(
-      `
+  const stmt = db.prepare(
+    `
       INSERT INTO commits (sha, repo, branch, date, data, fetched_at)
       VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(sha) DO UPDATE SET
@@ -1347,26 +1458,27 @@ function cacheCommits(commits) {
         date = excluded.date,
         data = excluded.data,
         fetched_at = excluded.fetched_at
-    `,
-      [
-        commit.sha,
-        REPO,
-        BRANCH,
-        commit.date || fetchedAt,
-        JSON.stringify(commit),
-        fetchedAt,
-      ]
-    );
+    `
+  );
+  dbRun("BEGIN");
+  for (const commit of commits) {
+    stmt.run([
+      commit.sha,
+      REPO,
+      BRANCH,
+      commit.date || fetchedAt,
+      JSON.stringify(commit),
+      fetchedAt,
+    ]);
   }
   dbRun("COMMIT");
+  stmt.free();
   persistDb();
 }
 
 function cacheIssues(items) {
-  dbRun("BEGIN");
-  for (const issue of items) {
-    dbRun(
-      `
+  const stmt = db.prepare(
+    `
       INSERT INTO issues (
         id, repo, number, title, url, created_at, updated_at, state, user_login, is_pr, data
       )
@@ -1382,23 +1494,61 @@ function cacheIssues(items) {
         user_login = excluded.user_login,
         is_pr = excluded.is_pr,
         data = excluded.data
-    `,
-      [
-        issue.id,
-        REPO,
-        issue.number,
-        issue.title,
-        issue.url,
-        issue.created_at,
-        issue.updated_at,
-        issue.state,
-        issue.user_login,
-        issue.is_pr,
-        JSON.stringify(issue),
-      ]
-    );
+    `
+  );
+  dbRun("BEGIN");
+  for (const issue of items) {
+    stmt.run([
+      issue.id,
+      REPO,
+      issue.number,
+      issue.title,
+      issue.url,
+      issue.created_at,
+      issue.updated_at,
+      issue.state,
+      issue.user_login,
+      issue.is_pr,
+      JSON.stringify(issue),
+    ]);
   }
   dbRun("COMMIT");
+  stmt.free();
+  persistDb();
+}
+
+function cacheReleases(items) {
+  const stmt = db.prepare(
+    `
+      INSERT INTO releases (
+        id, repo, tag_name, name, url, created_at, published_at, data
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        repo = excluded.repo,
+        tag_name = excluded.tag_name,
+        name = excluded.name,
+        url = excluded.url,
+        created_at = excluded.created_at,
+        published_at = excluded.published_at,
+        data = excluded.data
+    `
+  );
+  dbRun("BEGIN");
+  for (const release of items) {
+    stmt.run([
+      release.id,
+      REPO,
+      release.tag_name || "",
+      release.name || "",
+      release.url,
+      release.created_at || new Date().toISOString(),
+      release.published_at || null,
+      JSON.stringify(release),
+    ]);
+  }
+  dbRun("COMMIT");
+  stmt.free();
   persistDb();
 }
 
@@ -1488,6 +1638,28 @@ function loadIssues({ sinceIso, isPr }) {
   return rows.map((row) => JSON.parse(row.data));
 }
 
+function loadReleases({ sinceIso }) {
+  const rows = dbAll(
+    `
+    SELECT data FROM releases
+    WHERE repo = ? AND COALESCE(published_at, created_at) >= ?
+    ORDER BY COALESCE(published_at, created_at) DESC
+  `,
+    [REPO, sinceIso]
+  );
+  return rows.map((row) => {
+    const release = JSON.parse(row.data);
+    const date = release.published_at || release.created_at || null;
+    const sections = extractReleaseSections(release.body || "");
+    return {
+      ...release,
+      date,
+      highlights: sections.highlights,
+      breaking: sections.breaking,
+    };
+  });
+}
+
 function hasIssuesSince(sinceIso, isPr) {
   const row = dbGet(
     `
@@ -1500,12 +1672,36 @@ function hasIssuesSince(sinceIso, isPr) {
   return Number(row?.count || 0) > 0;
 }
 
+function hasReleasesSince(sinceIso) {
+  const row = dbGet(
+    `
+    SELECT COUNT(*) as count
+    FROM releases
+    WHERE repo = ? AND COALESCE(published_at, created_at) >= ?
+  `,
+    [REPO, sinceIso]
+  );
+  return Number(row?.count || 0) > 0;
+}
+
 function countIssuesSince(sinceIso) {
   const row = dbGet(
     `
     SELECT COUNT(*) as count
     FROM issues
     WHERE repo = ? AND created_at >= ?
+  `,
+    [REPO, sinceIso]
+  );
+  return Number(row?.count || 0);
+}
+
+function countReleasesSince(sinceIso) {
+  const row = dbGet(
+    `
+    SELECT COUNT(*) as count
+    FROM releases
+    WHERE repo = ? AND COALESCE(published_at, created_at) >= ?
   `,
     [REPO, sinceIso]
   );
@@ -1662,6 +1858,7 @@ async function syncCommits({ sinceIso, force }) {
 
 let commitsSyncPromise = null;
 let issuesSyncPromise = null;
+let releasesSyncPromise = null;
 const summaryJobs = new Map();
 
 function scheduleSummaryForDate(dateKey) {
@@ -1734,6 +1931,15 @@ async function runIssuesSync({ sinceIso, force }) {
   return issuesSyncPromise;
 }
 
+async function runReleasesSync({ sinceIso, force }) {
+  if (!releasesSyncPromise) {
+    releasesSyncPromise = syncReleases({ sinceIso, force }).finally(() => {
+      releasesSyncPromise = null;
+    });
+  }
+  return releasesSyncPromise;
+}
+
 function shouldSyncIssues({ sinceIso, force }) {
   if (force) return true;
   const backoffUntil = getMeta("issues_sync_backoff_until");
@@ -1749,6 +1955,102 @@ function shouldSyncIssues({ sinceIso, force }) {
   if (!lastSync) return true;
   const ageMs = Date.now() - new Date(lastSync).getTime();
   return ageMs > SYNC_INTERVAL_MINUTES * 60 * 1000;
+}
+
+function shouldSyncReleases({ sinceIso, force }) {
+  if (force) return true;
+  const backoffUntil = getMeta("releases_sync_backoff_until");
+  if (backoffUntil && Date.now() < new Date(backoffUntil).getTime()) {
+    return false;
+  }
+  const version = getMeta("cache_schema_version");
+  if (!version || version !== CACHE_SCHEMA_VERSION) return true;
+  if (!hasReleasesSince(sinceIso)) return true;
+  const lastSync = getMeta("last_releases_sync_at");
+  if (!lastSync) return true;
+  const ageMs = Date.now() - new Date(lastSync).getTime();
+  return ageMs > SYNC_INTERVAL_MINUTES * 60 * 1000;
+}
+
+async function syncReleases({ sinceIso, force }) {
+  if (!shouldSyncReleases({ sinceIso, force })) {
+    return {
+      synced: false,
+      source: "sqlite",
+      lastSyncAt: getMeta("last_releases_sync_at"),
+    };
+  }
+
+  const overlapMs = 5 * 60 * 1000;
+  const lastSync = getMeta("last_releases_sync_at");
+  const sinceMs = new Date(sinceIso).getTime();
+  const fetchSince = lastSync
+    ? new Date(Math.max(new Date(lastSync).getTime() - overlapMs, sinceMs)).toISOString()
+    : sinceIso;
+  const cutoffMs = new Date(fetchSince).getTime();
+
+  const fetched = [];
+  let page = 1;
+  const perPage = 100;
+  let reachedCutoff = false;
+
+  try {
+    while (true) {
+      const listUrl = new URL(`${GH_BASE}/releases`);
+      listUrl.searchParams.set("per_page", String(perPage));
+      listUrl.searchParams.set("page", String(page));
+
+      const list = await ghFetch(listUrl.toString());
+      if (!Array.isArray(list) || list.length === 0) break;
+
+      for (const item of list) {
+        if (item?.draft) continue;
+        const mapped = mapRelease(item);
+        const date = mapped.published_at || mapped.created_at;
+        if (date) {
+          const dateMs = new Date(date).getTime();
+          if (dateMs < cutoffMs) {
+            reachedCutoff = true;
+            continue;
+          }
+        }
+        fetched.push(mapped);
+      }
+
+      if (list.length < perPage || reachedCutoff) break;
+      page += 1;
+    }
+  } catch (error) {
+    if (error?.status === 403) {
+      const remaining = Number(error.rateLimitRemaining || 0);
+      const resetSeconds = Number(error.rateLimitReset || 0);
+      const isRateLimit =
+        remaining === 0 ||
+        String(error.details || "").toLowerCase().includes("rate limit");
+      if (isRateLimit) {
+        const resetAt = resetSeconds
+          ? new Date(resetSeconds * 1000).toISOString()
+          : new Date(Date.now() + 15 * 60 * 1000).toISOString();
+        setMeta("releases_sync_backoff_until", resetAt);
+      }
+    }
+    throw error;
+  }
+
+  if (fetched.length) {
+    cacheReleases(fetched);
+  }
+
+  const now = new Date().toISOString();
+  setMeta("last_releases_sync_at", now);
+  setMeta("last_releases_sync_fetched_count", String(fetched.length));
+  return {
+    synced: true,
+    source: "github",
+    lastSyncAt: now,
+    fetchSince,
+    fetchedCount: fetched.length,
+  };
 }
 
 async function syncIssuesAndPRs({ sinceIso, force }) {
@@ -1844,6 +2146,13 @@ app.get("/api/commits", async (req, res) => {
       pending: false,
       error: null,
     };
+    let releaseSync = {
+      source: "sqlite",
+      synced: false,
+      lastSyncAt: getMeta("last_releases_sync_at"),
+      pending: false,
+      error: null,
+    };
 
     if (forceSync) {
       try {
@@ -1897,9 +2206,37 @@ app.get("/api/commits", async (req, res) => {
           error: error.message,
         };
       }
+      try {
+        const releasesResult = await awaitWithTimeout(
+          runReleasesSync({ sinceIso, force: true }),
+          INITIAL_SYNC_TIMEOUT_MS
+        );
+        if (releasesResult?.__timeout) {
+          releaseSync = {
+            source: "sqlite",
+            synced: false,
+            lastSyncAt: getMeta("last_releases_sync_at"),
+            pending: true,
+            timeout: true,
+          };
+        } else {
+          releaseSync = releasesResult;
+        }
+      } catch (error) {
+        releaseSync = {
+          source: "sqlite-stale",
+          synced: false,
+          lastSyncAt: getMeta("last_releases_sync_at"),
+          error: error.message,
+        };
+      }
     } else {
       const shouldSyncCommits = shouldSync({ sinceIso, force: false });
       const shouldSyncIssuesFlag = shouldSyncIssues({ sinceIso, force: false });
+      const shouldSyncReleasesFlag = shouldSyncReleases({
+        sinceIso,
+        force: false,
+      });
       if (shouldSyncCommits) {
         runCommitsSync({ sinceIso, force: false }).catch((error) => {
           console.warn("Commit sync failed:", error.message);
@@ -1910,8 +2247,14 @@ app.get("/api/commits", async (req, res) => {
           console.warn("Issue sync failed:", error.message);
         });
       }
+      if (shouldSyncReleasesFlag) {
+        runReleasesSync({ sinceIso, force: false }).catch((error) => {
+          console.warn("Release sync failed:", error.message);
+        });
+      }
       sync.pending = shouldSyncCommits;
       issueSync.pending = shouldSyncIssuesFlag;
+      releaseSync.pending = shouldSyncReleasesFlag;
     }
 
     const responseCommits = loadCachedCommits({ sinceIso });
@@ -1921,16 +2264,19 @@ app.get("/api/commits", async (req, res) => {
     }
     const issues = loadIssues({ sinceIso, isPr: false });
     const pullRequests = loadIssues({ sinceIso, isPr: true });
+    const releases = loadReleases({ sinceIso });
     const summaries = loadSummaries({ sinceIso });
     const summariesByDate = new Map(
       summaries.map((entry) => [entry.date, entry])
     );
     const issuesByDate = groupByDateKey(issues, "created_at");
     const prsByDate = groupByDateKey(pullRequests, "created_at");
+    const releasesByDate = groupByDateKey(releases, "date");
     const daysWithExtras = groupByDate(responseCommits).map((day) => ({
       ...day,
       issues: issuesByDate.get(day.date) || [],
       pullRequests: prsByDate.get(day.date) || [],
+      releases: releasesByDate.get(day.date) || [],
       summary: summariesByDate.get(day.date)?.summary || null,
       summaryFingerprint: summariesByDate.get(day.date)?.fingerprint || null,
     }));
@@ -1973,6 +2319,23 @@ app.get("/api/commits", async (req, res) => {
           error: issueSync.error || null,
           backoffUntil: getMeta("issues_sync_backoff_until"),
           count: issues.length + pullRequests.length,
+        },
+        releases: {
+          source: releaseSync.source,
+          synced: releaseSync.synced,
+          lastSyncAt:
+            releaseSync.lastSyncAt || getMeta("last_releases_sync_at"),
+          fetchSince: releaseSync.fetchSince || null,
+          fetchedCount: releaseSync.fetchedCount || 0,
+          lastSyncFetchedCount: Number(
+            getMeta("last_releases_sync_fetched_count") || 0
+          ),
+          pending: releaseSync.pending || false,
+          syncing: Boolean(releasesSyncPromise),
+          timeout: releaseSync.timeout || false,
+          error: releaseSync.error || null,
+          backoffUntil: getMeta("releases_sync_backoff_until"),
+          count: releases.length,
         },
       },
       days: daysWithExtras,
@@ -2030,6 +2393,15 @@ app.get("/api/status", (req, res) => {
         syncing: Boolean(issuesSyncPromise),
         count: countIssuesSince(sinceIso),
         backoffUntil: getMeta("issues_sync_backoff_until"),
+      },
+      releases: {
+        lastSyncAt: getMeta("last_releases_sync_at"),
+        lastSyncFetchedCount: Number(
+          getMeta("last_releases_sync_fetched_count") || 0
+        ),
+        syncing: Boolean(releasesSyncPromise),
+        count: countReleasesSince(sinceIso),
+        backoffUntil: getMeta("releases_sync_backoff_until"),
       },
     },
   });

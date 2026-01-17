@@ -4,6 +4,7 @@ const state = {
   initializing: false,
   lastSyncAt: null,
   lastIssuesSyncAt: null,
+  lastReleasesSyncAt: null,
   statusTimer: null,
   newDataAvailable: false,
 };
@@ -48,6 +49,62 @@ function formatDelta(stats = {}) {
   const additions = stats.additions ?? 0;
   const deletions = stats.deletions ?? 0;
   return `+${additions} / -${deletions}`;
+}
+
+function buildReleaseNotesHtml(release) {
+  const highlights = Array.isArray(release.highlights) ? release.highlights : [];
+  const breaking = Array.isArray(release.breaking) ? release.breaking : [];
+  const sections = [];
+
+  const renderList = (items) =>
+    items.length
+      ? `
+        <ul>
+          ${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+        </ul>
+      `
+      : "";
+
+  if (highlights.length) {
+    sections.push(`
+      <div class="release-section">
+        <div class="release-label">Highlights</div>
+        ${renderList(highlights)}
+      </div>
+    `);
+  }
+
+  if (breaking.length) {
+    sections.push(`
+      <div class="release-section breaking">
+        <div class="release-label">Breaking changes</div>
+        ${renderList(breaking)}
+      </div>
+    `);
+  }
+
+  if (!sections.length) {
+    return `<p class="release-empty">No highlights or breaking changes listed.</p>`;
+  }
+
+  return sections.join("");
+}
+
+function buildReleaseItem(release) {
+  const title = release.name || release.tag_name || "Release";
+  const titleHtml = release.url
+    ? `<a href="${release.url}" target="_blank" rel="noreferrer">${escapeHtml(
+        title
+      )}</a>`
+    : escapeHtml(title);
+  return `
+    <li class="release-item">
+      <div class="release-title">${titleHtml}</div>
+      <div class="release-notes">
+        ${buildReleaseNotesHtml(release)}
+      </div>
+    </li>
+  `;
 }
 
 function renderEmpty(message, title = "No commits found") {
@@ -246,6 +303,26 @@ function buildDayCard(day, index) {
             </ul>
           </div>
         </details>
+        <details class="info-card">
+          <summary class="info-summary">
+            <span class="info-left">
+              <span class="info-caret" aria-hidden="true">▸</span>
+              <span>${day.releases?.length || 0} releases today</span>
+            </span>
+            <span class="info-count">Releases</span>
+          </summary>
+          <div class="info-body">
+            <ul class="release-list">
+              ${
+                day.releases?.length
+                  ? day.releases
+                      .map((release) => buildReleaseItem(release))
+                      .join("")
+                  : "<li class=\"release-empty\">No releases.</li>"
+              }
+            </ul>
+          </div>
+        </details>
       </div>
     </article>
   `;
@@ -313,8 +390,23 @@ function applySyncPillStatus({ syncing, newData, lastSyncAt, error }) {
 }
 
 function startStatusPolling() {
-  if (state.statusTimer) return;
+  if (state.statusTimer || document.hidden) return;
   state.statusTimer = setInterval(fetchStatus, 20000);
+}
+
+function stopStatusPolling() {
+  if (!state.statusTimer) return;
+  clearInterval(state.statusTimer);
+  state.statusTimer = null;
+}
+
+function handleVisibilityChange() {
+  if (document.hidden) {
+    stopStatusPolling();
+    return;
+  }
+  startStatusPolling();
+  fetchStatus();
 }
 
 async function fetchStatus() {
@@ -324,8 +416,10 @@ async function fetchStatus() {
     const data = await response.json();
     const cache = data.cache || {};
     const issuesCache = cache.issues || {};
+    const releasesCache = cache.releases || {};
     const lastSyncAt = cache.lastSyncAt;
     const lastIssuesSyncAt = issuesCache.lastSyncAt;
+    const lastReleasesSyncAt = releasesCache.lastSyncAt;
     const newCommits =
       lastSyncAt &&
       state.lastSyncAt &&
@@ -336,17 +430,26 @@ async function fetchStatus() {
       state.lastIssuesSyncAt &&
       new Date(lastIssuesSyncAt) > new Date(state.lastIssuesSyncAt) &&
       Number(issuesCache.lastSyncFetchedCount || 0) > 0;
-    const newData = Boolean(newCommits || newIssues);
+    const newReleases =
+      lastReleasesSyncAt &&
+      state.lastReleasesSyncAt &&
+      new Date(lastReleasesSyncAt) > new Date(state.lastReleasesSyncAt) &&
+      Number(releasesCache.lastSyncFetchedCount || 0) > 0;
+    const newData = Boolean(newCommits || newIssues || newReleases);
     if (!newData) {
       state.lastSyncAt = lastSyncAt || state.lastSyncAt;
       state.lastIssuesSyncAt = lastIssuesSyncAt || state.lastIssuesSyncAt;
+      state.lastReleasesSyncAt =
+        lastReleasesSyncAt || state.lastReleasesSyncAt;
     }
     state.newDataAvailable = newData;
     applySyncPillStatus({
-      syncing: Boolean(cache.syncing || issuesCache.syncing),
+      syncing: Boolean(
+        cache.syncing || issuesCache.syncing || releasesCache.syncing
+      ),
       newData,
       lastSyncAt: lastSyncAt || state.lastSyncAt,
-      error: cache.error || issuesCache.error,
+      error: cache.error || issuesCache.error || releasesCache.error,
     });
   } catch {
     // Ignore status polling errors.
@@ -395,6 +498,8 @@ async function loadCommits(force = false) {
     state.lastSyncAt = data.cache?.lastSyncAt || state.lastSyncAt;
     state.lastIssuesSyncAt =
       data.cache?.issues?.lastSyncAt || state.lastIssuesSyncAt;
+    state.lastReleasesSyncAt =
+      data.cache?.releases?.lastSyncAt || state.lastReleasesSyncAt;
     state.newDataAvailable = false;
     if (data.cache?.initializing && data.days.length === 0) {
       renderEmpty(
@@ -403,10 +508,17 @@ async function loadCommits(force = false) {
       );
       updateMeta(state.data);
       applySyncPillStatus({
-        syncing: Boolean(data.cache?.syncing || data.cache?.issues?.syncing),
+        syncing: Boolean(
+          data.cache?.syncing ||
+            data.cache?.issues?.syncing ||
+            data.cache?.releases?.syncing
+        ),
         newData: false,
         lastSyncAt: data.cache?.lastSyncAt || state.lastSyncAt,
-        error: data.cache?.error || data.cache?.issues?.error,
+        error:
+          data.cache?.error ||
+          data.cache?.issues?.error ||
+          data.cache?.releases?.error,
       });
       startStatusPolling();
       return;
@@ -414,10 +526,17 @@ async function loadCommits(force = false) {
     renderTimeline(state.data);
     updateMeta(state.data);
     applySyncPillStatus({
-      syncing: Boolean(data.cache?.syncing || data.cache?.issues?.syncing),
+      syncing: Boolean(
+        data.cache?.syncing ||
+          data.cache?.issues?.syncing ||
+          data.cache?.releases?.syncing
+      ),
       newData: false,
       lastSyncAt: data.cache?.lastSyncAt || state.lastSyncAt,
-      error: data.cache?.error || data.cache?.issues?.error,
+      error:
+        data.cache?.error ||
+        data.cache?.issues?.error ||
+        data.cache?.releases?.error,
     });
     startStatusPolling();
     scrollToHash();
@@ -570,5 +689,8 @@ if (elements.syncPill) {
     }
   });
 }
+
+document.addEventListener("visibilitychange", handleVisibilityChange);
+window.addEventListener("beforeunload", stopStatusPolling);
 
 loadCommits();
